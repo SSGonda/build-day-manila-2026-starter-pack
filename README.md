@@ -26,6 +26,7 @@ uv run -m agent --practice
 ├── api/src/api/       🔒 HTTP client for the game server (don't edit)
 ├── agent/src/agent/   ✏️  Your AI agent (edit this!)
 │   ├── __main__.py         CLI entry point
+│   ├── preview.py          Frame-batch preview UI
 │   └── prompt.py           Your prompt & analysis logic
 └── .env                    Your team config
 ```
@@ -40,6 +41,9 @@ Uses your local camera. No server connection needed. Great for tuning your promp
 uv run -m agent --practice
 uv run -m agent --practice --camera 1    # use a different camera
 uv run -m agent --practice --fps 2       # sample 2 frames/sec
+uv run -m agent --practice --analysis-frames 6   # send 6 recent frames to analyze
+uv run -m agent --practice --max-analysis-frames 16
+uv run -m agent --practice --no-preview-ui       # disable preview window
 ```
 
 ### Live Mode (event day)
@@ -58,17 +62,18 @@ uv run -m agent --live
 ## How It Works
 
 1. A frame is captured (from your camera or the live stream)
-2. Your `analyze()` function in `agent/prompt.py` receives the frame
-3. You send it to a vision LLM and return a guess (or `None` to skip)
-4. If in live mode, the guess is submitted via `POST /api/guess` (plain text body)
-5. If correct (HTTP 201), you win. If wrong (HTTP 409), keep guessing. The server may return 401 (bad token), 404 (no round), 429 (max guesses), or 503 (judge unavailable — live mode retries with exponential backoff, then continues on the next frame if the judge stays down).
-6. The round ends when the admin closes the stream.
+2. A rolling history is maintained, and your preview window shows the exact frames queued for analysis
+3. Your `analyze()` function in `agent/prompt.py` receives an ordered frame batch (oldest to newest)
+4. You send it to a vision LLM and return a guess (or `None` to skip)
+5. If in live mode, the guess is submitted via `POST /api/guess` (plain text body)
+6. If correct (HTTP 201), you win. If wrong (HTTP 409), keep guessing. The server may return 401 (bad token), 404 (no round), 429 (max guesses), or 503 (judge unavailable — live mode retries with exponential backoff, then continues on the next frame if the judge stays down).
+7. The round ends when the admin closes the stream.
 
 ## What to Edit
 
 Open `agent/src/agent/prompt.py`. That's it. Customize:
 
 - **`SYSTEM_PROMPT`** — the instructions for your vision LLM
-- **`analyze(frame)`** — your logic for turning a frame into a guess
+- **`analyze(frames)`** — your logic for turning a frame sequence into a guess
 
 See [AGENTS.md](./AGENTS.md) for tips.

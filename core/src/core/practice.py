@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import platform
+import re
 import shutil
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import AsyncIterator, Sequence
 
 from PIL import Image
 
@@ -31,7 +32,11 @@ def _detect_ffmpeg() -> str:
     )
 
 
-def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
+def _build_capture_cmd(
+    ffmpeg: str,
+    camera_index: int,
+    windows_devices: Sequence[str] | None = None,
+) -> list[str]:
     """Build a platform-appropriate ffmpeg command for single-frame capture."""
     system = platform.system()
 
@@ -44,7 +49,10 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
         device = str(camera_index)
     elif system == "Windows":
         input_fmt = ["-f", "dshow"]
-        device = f"video={camera_index}"
+        if windows_devices is not None and 0 <= camera_index < len(windows_devices):
+            device = f"video={windows_devices[camera_index]}"
+        else:
+            device = f"video={camera_index}"
     else:
         input_fmt = ["-f", "v4l2"]
         device = f"/dev/video{camera_index}"
@@ -59,6 +67,71 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
         "-vcodec", "rawvideo",
         "pipe:1",
     ]
+
+
+async def _list_windows_video_devices(ffmpeg: str) -> list[str]:
+    """Enumerate available DirectShow camera device names on Windows."""
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-list_devices",
+        "true",
+        "-f",
+        "dshow",
+        "-i",
+        "dummy",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    output = stderr.decode(errors="replace")
+
+    devices: list[str] = []
+    in_video_section = False
+    saw_section_headers = False
+
+    for line in output.splitlines():
+        lower = line.lower()
+
+        # Newer ffmpeg builds can emit: "Device Name" (video|audio|none)
+        typed_match = re.search(r'"([^"]+)"\s+\(([^)]+)\)', line)
+        if typed_match and "alternative name" not in lower:
+            name = typed_match.group(1).strip()
+            media_type = typed_match.group(2).strip().lower()
+            if name and media_type != "audio" and name not in devices:
+                devices.append(name)
+            continue
+
+        if "directshow video devices" in lower:
+            saw_section_headers = True
+            in_video_section = True
+            continue
+        if "directshow audio devices" in lower:
+            if saw_section_headers:
+                break
+            continue
+        if not in_video_section:
+            continue
+        if "alternative name" in lower:
+            continue
+
+        match = re.search(r'"([^"]+)"', line)
+        if not match:
+            continue
+
+        name = match.group(1).strip()
+        if name and name not in devices:
+            devices.append(name)
+
+    return devices
+
+
+def _format_windows_camera_options(devices: Sequence[str]) -> str:
+    """Render a compact camera index list for user-facing error messages."""
+    return ", ".join(f"{idx}: {name}" for idx, name in enumerate(devices))
 
 
 async def _capture_one_frame(cmd: list[str]) -> Image.Image:
@@ -113,7 +186,33 @@ async def start_practice(
         print(f"[!] {exc}")
         return
 
-    cmd = _build_capture_cmd(ffmpeg, camera_index)
+    if platform.system() == "Windows":
+        devices = await _list_windows_video_devices(ffmpeg)
+
+        if devices:
+            if camera_index < 0 or camera_index >= len(devices):
+                options = _format_windows_camera_options(devices)
+                print(
+                    f"[!] Camera index {camera_index} is out of range. "
+                    f"Available cameras: {options}"
+                )
+                return
+
+            selected = devices[camera_index]
+            cmd = _build_capture_cmd(
+                ffmpeg,
+                camera_index,
+                windows_devices=devices,
+            )
+            print(f"[practice] Using camera {camera_index}: {selected}")
+        else:
+            print(
+                "[practice] No DirectShow cameras were enumerated. "
+                "Trying raw index fallback."
+            )
+            cmd = _build_capture_cmd(ffmpeg, camera_index)
+    else:
+        cmd = _build_capture_cmd(ffmpeg, camera_index)
 
     try:
         test_frame = await _capture_one_frame(cmd)

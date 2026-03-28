@@ -11,13 +11,15 @@ This is where you define your agent's strategy:
 from __future__ import annotations
 
 import io
+import time
 
 from dotenv import load_dotenv
 from pydantic_ai import Agent, BinaryContent
+from PIL import Image
 
 from core import Frame
 from agent.pipeline import (
-    MAX_SKELETON_BUFFER,
+    MAX_KEYFRAMES_TO_LLM,
     MIN_SEQUENCE_LEN,
     get_or_init_state,
     reset_state,
@@ -55,7 +57,10 @@ CONFIDENCE: <0-100>
 If uncertain, set confidence below 50.
 """
 
-_agent = Agent("openrouter:qwen/qwen3.5-flash-02-23")
+_agent = Agent("openrouter:google/gemini-3.1-flash-lite-preview")
+
+_LLM_IMAGE_MAX_SIDE = 640
+_LLM_JPEG_QUALITY = 70
 
 
 def record_wrong_guess(guess: str) -> None:
@@ -130,10 +135,14 @@ async def analyze(frame: Frame) -> str | None:
     # 6. Build skeleton motion summary from keypoint buffer
     motion_summary = _build_motion_summary(state.skeleton_buffer)
 
-    # 7. Build LLM prompt with skeleton context
+    # 7. Select keyframes to keep LLM payload small and responsive
+    keyframes = _select_keyframes(list(state.frame_buffer), MAX_KEYFRAMES_TO_LLM)
+
+    # 8. Build LLM prompt with skeleton context
     prompt = f"""{SYSTEM_PROMPT}
 
-You are viewing {len(state.frame_buffer)} frames from a live charades performance.
+You are viewing {len(keyframes)} keyframes sampled from {len(state.frame_buffer)} recent
+frames of a live charades performance.
 
 SKELETON ANALYSIS (from pose detection):
 {motion_summary}
@@ -145,18 +154,25 @@ GUESS: <your answer>
 CONFIDENCE: <0-100>
 If you are uncertain, set confidence below 50.{excluded}"""
 
-    # 8. Attach keyframes (last N frames as images)
+    # 9. Attach only sampled keyframes as compressed images
     message_parts: list = [prompt]
     img_bytes_list = []
-    for img in state.frame_buffer:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_data = buf.getvalue()
+    for img in keyframes:
+        img_data = _encode_llm_image(img)
         img_bytes_list.append(img_data)
         message_parts.append(BinaryContent(data=img_data, media_type="image/jpeg"))
 
-    # 9. Run LLM
+    payload_kb = sum(len(blob) for blob in img_bytes_list) / 1024.0
+    print(
+        f"  [agent] LLM input: {len(keyframes)} image(s), "
+        f"~{payload_kb:.1f} KB payload"
+    )
+
+    # 10. Run LLM
+    llm_start = time.perf_counter()
     result = await _agent.run(message_parts)
+    llm_elapsed = time.perf_counter() - llm_start
+    print(f"  [agent] LLM response in {llm_elapsed:.2f}s")
     response = result.output.strip()
 
     guess = None
@@ -176,12 +192,12 @@ If you are uncertain, set confidence below 50.{excluded}"""
         print(f"  [agent] Low confidence ({confidence}) or no guess, skipping")
         return None
 
-    # 10. Check if this guess was already rejected
+    # 11. Check if this guess was already rejected
     if state.feedback.is_rejected(guess):
         print(f"  [agent] Guess '{guess}' was already rejected, skipping")
         return None
 
-    # 11. Budget check — should we spend a guess?
+    # 12. Budget check — should we spend a guess?
     elapsed = (frame.timestamp - state.round_start).total_seconds()
     if not state.guess_budget.should_guess(confidence / 100.0, elapsed):
         print(
@@ -190,7 +206,7 @@ If you are uncertain, set confidence below 50.{excluded}"""
         )
         return None
 
-    # 12. Register and return the guess
+    # 13. Register and return the guess
     state.guess_budget.used += 1
     state.feedback.register_guess(guess)
     print(
@@ -198,6 +214,36 @@ If you are uncertain, set confidence below 50.{excluded}"""
         f"'{guess}' (conf={confidence}%)"
     )
     return guess
+
+
+def _select_keyframes(frames: list[Image.Image], max_keyframes: int) -> list[Image.Image]:
+    """Sample up to max_keyframes frames evenly from oldest to newest."""
+    if not frames:
+        return []
+    if max_keyframes <= 0 or len(frames) <= max_keyframes:
+        return frames
+    if max_keyframes == 1:
+        return [frames[-1]]
+
+    last = len(frames) - 1
+    indices = [(i * last) // (max_keyframes - 1) for i in range(max_keyframes)]
+    return [frames[i] for i in indices]
+
+
+def _encode_llm_image(img: Image.Image) -> bytes:
+    """Resize and JPEG-compress image to reduce LLM round-trip latency."""
+    prepared = img.convert("RGB") if img.mode != "RGB" else img.copy()
+    resampling = getattr(Image, "Resampling", Image)
+    prepared.thumbnail((_LLM_IMAGE_MAX_SIDE, _LLM_IMAGE_MAX_SIDE), resampling.BILINEAR)
+
+    buf = io.BytesIO()
+    prepared.save(
+        buf,
+        format="JPEG",
+        quality=_LLM_JPEG_QUALITY,
+        optimize=True,
+    )
+    return buf.getvalue()
 
 
 def _build_motion_summary(skeleton_buffer) -> str:

@@ -15,7 +15,7 @@ from PIL import Image
 
 # ── Configuration Constants ──────────────────────────────────────────
 
-MIN_SEQUENCE_LEN = 5  # Minimum skeleton frames before HAR runs
+MIN_SEQUENCE_LEN = 3  # Minimum skeleton frames before HAR runs
 HIGH_THRESH = 0.85  # HAR confidence for direct submission (fast path)
 MED_THRESH = 0.40  # HAR confidence for LLM reasoning (medium path)
 MAX_KEYFRAMES_TO_LLM = 4  # Number of raw frames sent to LLM

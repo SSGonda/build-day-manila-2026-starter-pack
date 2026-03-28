@@ -20,6 +20,7 @@ def _detect_ffmpeg() -> str:
         return path
     try:
         import imageio_ffmpeg
+
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         pass
@@ -31,32 +32,64 @@ def _detect_ffmpeg() -> str:
     )
 
 
-def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
+async def _list_devices(ffmpeg: str) -> list[str]:
+    """List available video devices."""
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-list_devices",
+        "true",
+        "-f",
+        "dshow",
+        "-i",
+        "",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    output = (stdout + stderr).decode(errors="replace")
+    devices = []
+    for line in output.split("\n"):
+        if '"' in line and "(video)" in line:
+            start = line.find('"') + 1
+            end = line.find('"', start)
+            if start > 0 and end > start:
+                devices.append(line[start:end])
+    return devices
+
+
+def _build_capture_cmd(ffmpeg: str, device: str) -> list[str]:
     """Build a platform-appropriate ffmpeg command for single-frame capture."""
     system = platform.system()
 
     if system == "Linux":
         input_fmt = ["-f", "v4l2"]
-        device = f"/dev/video{camera_index}"
+        device = f"/dev/video{device}"
     elif system == "Darwin":
-        # avfoundation defaults to ~29.97 fps; many Mac cameras only allow 30.0.
         input_fmt = ["-f", "avfoundation", "-framerate", "30"]
-        device = str(camera_index)
     elif system == "Windows":
         input_fmt = ["-f", "dshow"]
-        device = f"video={camera_index}"
+        if device:
+            device = f"video={device}"
     else:
         input_fmt = ["-f", "v4l2"]
-        device = f"/dev/video{camera_index}"
+        device = f"/dev/video{device}"
 
     return [
         ffmpeg,
-        "-hide_banner", "-loglevel", "error",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         *input_fmt,
-        "-i", device,
-        "-vframes", "1",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-vcodec", "rawvideo",
+        "-i",
+        device,
+        "-vframes",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-vcodec",
+        "rawvideo",
         "pipe:1",
     ]
 
@@ -79,7 +112,14 @@ async def _capture_one_frame(cmd: list[str]) -> Image.Image:
 
     raw = stdout
     num_bytes = len(raw)
-    for w, h in [(640, 480), (1280, 720), (1920, 1080), (320, 240), (800, 600)]:
+    for w, h in [
+        (640, 480),
+        (1280, 720),
+        (1920, 1080),
+        (320, 240),
+        (800, 600),
+        (640, 360),
+    ]:
         if w * h * 3 == num_bytes:
             return Image.frombytes("RGB", (w, h), raw)
 
@@ -104,21 +144,33 @@ async def start_practice(
     """
     interval = 1.0 / fps
 
-    print(f"[practice] Opening camera {camera_index}...")
-    print(f"[practice] Sampling at {fps} FPS. Press Ctrl+C to stop.\n")
-
     try:
         ffmpeg = _detect_ffmpeg()
     except FileNotFoundError as exc:
         print(f"[!] {exc}")
         return
 
-    cmd = _build_capture_cmd(ffmpeg, camera_index)
+    device = str(camera_index)
+    if platform.system() == "Windows":
+        devices = await _list_devices(ffmpeg)
+        if devices and 0 <= camera_index < len(devices):
+            device = devices[camera_index]
+            print(f"[practice] Using camera {device}")
+        elif devices:
+            device = devices[0]
+            print(f"[practice] Camera {camera_index} not found, using {device}")
+
+    print(f"[practice] Opening camera {device}...")
+    print(f"[practice] Sampling at {fps} FPS. Press Ctrl+C to stop.\n")
+
+    cmd = _build_capture_cmd(ffmpeg, device)
 
     try:
         test_frame = await _capture_one_frame(cmd)
-        print(f"[practice] Camera {camera_index} ready "
-              f"({test_frame.size[0]}x{test_frame.size[1]}).\n")
+        print(
+            f"[practice] Camera {camera_index} ready "
+            f"({test_frame.size[0]}x{test_frame.size[1]}).\n"
+        )
     except Exception as exc:
         print(f"[!] Could not capture from camera {camera_index}: {exc}")
         return

@@ -10,30 +10,63 @@ This is where you define your agent's strategy:
 
 from __future__ import annotations
 
+import io
+
+from dotenv import load_dotenv
+from pydantic_ai import Agent, BinaryContent
+
 from core import Frame
 
-# ---------------------------------------------------------------------------
-# System prompt — tweak this to improve your agent's guessing ability.
-# ---------------------------------------------------------------------------
+load_dotenv()
 
 SYSTEM_PROMPT = """\
-You are playing a visual guessing game. You will receive a screenshot from a
-live camera feed. Your goal is to identify what is being shown as quickly and
-accurately as possible.
+You are playing a charades guessing game. A person will act out a word or phrase using gestures, body movements, and facial expressions. Your goal is to identify what is being acted out as quickly as possible.
 
-Rules:
-- Give your best guess as a short, specific answer (1-5 words).
-- If you're not confident enough yet, respond with exactly "SKIP".
-- Be specific: "golden retriever" is better than "dog".
-- You only get to see one frame at a time, so make it count.
+What to look for:
+- Hand signals and gestures (thumbs up, pointing, counting on fingers)
+- Body movements (walking, swimming, flying, dancing)
+- Facial expressions (happy, scared, confused, trophy pose)
+- Props or objects held up
+- Mouthing words (lip-reading)
+- Common charades signals: fingers indicating word count, hand over mouth = "can't talk"
+
+Categories (actor may hint at which one):
+- Movies, TV shows
+- Songs, books
+- Common idioms or phrases
+- Objects, animals, activities
+
+Strategy:
+- If you see someone gesturing, describe what they're DOING, not just what they're wearing
+- Look for the overall action-concept, not details
+- If unclear, wait for more frames - the actor will give clearer signals
+- Answer in 1-5 words, be specific: "flying a kite" not just "kite"
+
+Response format (ALWAYS follow exactly):
+GUESS: <your answer>
+CONFIDENCE: <0-100>
+If uncertain, set confidence below 50.
 """
+
+_agent = Agent("openrouter:qwen/qwen3.5-flash-02-23")
+
+_wrong_guesses: list[str] = []
+_frame_buffer: list[bytes] = []
+_MAX_BUFFERED_FRAMES = 5
+
+
+def record_wrong_guess(guess: str) -> None:
+    """Call this when a guess is rejected (429 response)."""
+    _wrong_guesses.append(guess)
+
+
+def reset_buffer() -> None:
+    """Clear the frame buffer after a correct guess."""
+    _frame_buffer.clear()
 
 
 async def analyze(frame: Frame) -> str | None:
-    """Analyze a single frame and return a guess, or None to skip.
-
-    This is the core function you should customize. The default
-    implementation is a simple placeholder that always skips.
+    """Analyze buffered frames and return a guess, or None to skip.
 
     Args:
         frame: A Frame with .image (PIL Image) and .timestamp.
@@ -41,23 +74,58 @@ async def analyze(frame: Frame) -> str | None:
     Returns:
         A text guess string, or None to skip this frame.
     """
-    # -----------------------------------------------------------------
-    # TODO: Replace this with your actual vision LLM call.
-    #
-    # Example with pydantic-ai:
-    #
-    #   from pydantic_ai import Agent
-    #   agent = Agent("claude-sonnet-4-20250514", system_prompt=SYSTEM_PROMPT)
-    #   result = await agent.run(
-    #       "What do you see in this image?",
-    #       # attach the frame image here
-    #   )
-    #   answer = result.output.strip()
-    #   return None if answer == "SKIP" else answer
-    # -----------------------------------------------------------------
+    print(
+        f"  [agent] Got frame at {frame.timestamp.isoformat()} "
+        f"({frame.image.size[0]}x{frame.image.size[1]})"
+    )
 
-    print(f"  [agent] Got frame at {frame.timestamp.isoformat()} "
-          f"({frame.image.size[0]}x{frame.image.size[1]})")
-    print("  [agent] No LLM configured yet — edit agent/prompt.py!")
+    img_bytes = io.BytesIO()
+    frame.image.save(img_bytes, format="JPEG")
+    img_bytes = img_bytes.getvalue()
 
-    return None
+    _frame_buffer.append(img_bytes)
+    if len(_frame_buffer) > _MAX_BUFFERED_FRAMES:
+        _frame_buffer.pop(0)
+
+    print(f"  [agent] Buffer: {len(_frame_buffer)} frames")
+
+    context = ""
+    if _wrong_guesses:
+        context = f"\n\nThese previous guesses were WRONG - do not guess them again:\n"
+        for g in _wrong_guesses:
+            context += f"- {g}\n"
+
+    prompt = f"""{SYSTEM_PROMPT}
+
+You are viewing a sequence of {len(_frame_buffer)} frames from a video.
+Analyze all frames together to understand the action being performed.
+
+Respond in this exact format:
+GUESS: <your answer>
+CONFIDENCE: <0-100>
+If you are uncertain, set confidence below 50.{context}"""
+
+    message_parts: list = [prompt]
+    for fb in _frame_buffer:
+        message_parts.append(BinaryContent(data=fb, media_type="image/jpeg"))
+
+    result = await _agent.run(message_parts)
+    response = result.output.strip()
+
+    guess = None
+    confidence = 0
+
+    for line in response.split("\n"):
+        line = line.strip()
+        if line.startswith("GUESS:"):
+            guess = line[6:].strip()
+        elif line.startswith("CONFIDENCE:"):
+            try:
+                confidence = int(line[11:].strip())
+            except ValueError:
+                pass
+
+    if confidence < 50 or not guess:
+        return None
+
+    return guess

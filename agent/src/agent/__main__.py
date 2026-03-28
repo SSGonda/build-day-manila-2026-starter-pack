@@ -130,7 +130,9 @@ async def run_live() -> None:
                             await asyncio.sleep(delay)
                             n_503 += 1
                 except Unauthorized:
-                    print("[!] Unauthorized. Check TEAM_TOKEN matches your team's API key.")
+                    print(
+                        "[!] Unauthorized. Check TEAM_TOKEN matches your team's API key."
+                    )
                     break
                 except NoActiveRound:
                     print("[!] No active round (round may have ended).")
@@ -148,7 +150,9 @@ async def run_live() -> None:
                     continue
 
                 guess_count += 1
-                id_suffix = f" id={result.guess_id}" if result.guess_id is not None else ""
+                id_suffix = (
+                    f" id={result.guess_id}" if result.guess_id is not None else ""
+                )
                 print(f"  [guess #{guess_count}{id_suffix}] {guess}")
 
                 if result.correct:
@@ -156,7 +160,14 @@ async def run_live() -> None:
                     print("=" * 50)
                     print(f"  CORRECT! Solved in {guess_count} guesses.")
                     print("=" * 50)
+                    from agent.prompt import reset_buffer
+
+                    reset_buffer()
                     break
+                else:
+                    from agent.prompt import record_wrong_guess
+
+                    record_wrong_guess(guess)
             else:
                 print("  [skip] No guess this frame")
 
@@ -182,4 +193,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nBye!")
         import os
+
         os._exit(0)
